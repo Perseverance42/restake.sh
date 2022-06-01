@@ -14,6 +14,14 @@ if [ -z ${TMP+x} ]; then
 fi
 
 sanity_checks() {
+    if [ ! -d "${TMP}" ]; then
+        mkdir "${TMP}"
+    else
+        2>/dev/null rm -f "${TMP}"/*
+    fi
+
+    echo "{}" > "${TMP}/test"
+
     if ! command -v jq >/dev/null; then
         echo "jq is not found in PATH!"
         exit 1
@@ -22,6 +30,16 @@ sanity_checks() {
         exit 1
     elif [ -z ${VALIDATOR+x} ] || [ -z ${BOT+x} ]; then
         echo "Environment variables are not configured yet?"
+        exit 1
+    elif ! ${BIN} keys show -a "${KEY}" > "${TMP}/address"; then
+        echo "Keyring is not correctly configured?"
+        exit 1
+    elif [ "$(cat "${TMP}"/address)" != "${BOT}" ]; then
+        echo "Keyring address does not match bot wallet (${BOT})?"
+        exit 1
+    elif ! jq . "${TMP}/test"; then
+        # https://stackoverflow.com/questions/58128001/could-not-open-file-lol-json-permission-denied-using-jq
+        echo "jq wasn't able to load a test JSON. Make sure you're not using the Snap version of jq."
         exit 1
     fi
 }
@@ -106,9 +124,8 @@ load_granters() {
         return
     fi
 
-    withdraw=$(jq -r "select(.authorization.msg==\"/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward\" and .expiration > now)" "${tmp}")
     delegate=$(jq -r "select(((.authorization.\"@type\"==\"/cosmos.staking.v1beta1.StakeAuthorization\" and (.authorization.allow_list.address[] | contains(\"$VALIDATOR\"))) or (.authorization.\"@type\"==\"/cosmos.authz.v1beta1.GenericAuthorization\" and .authorization.msg==\"/cosmos.staking.v1beta1.MsgDelegate\")) and .expiration > now)" "${tmp}")
-    if [ -z "${withdraw}" ] || [ -z "${delegate}" ]; then
+    if [ -z "${delegate}" ]; then
         return
     fi
 
@@ -135,27 +152,26 @@ load_delegations() {
         echo "Failed to fetch delegation for $1"
         return
     fi
-    stake=$(jq -r ".delegation.shares | tonumber" "$tmp")
-    if [ "$stake" -le "0" ] || [ "$stake" == "" ]; then
+    stake=$(jq -r '.delegation.shares as $s | ($s != null and $s != "" and ($s | tonumber > 0))' "$tmp")
+    if [ "$stake" != "true" ]; then
         return
     fi
 
-    if ! ${BIN} q distribution rewards "$1" "${VALIDATOR}" -o json > "$tmp"; then
+    if ! ${BIN} q distribution rewards "$1" "${VALIDATOR}" -o json > "${tmp}.rewards"; then
         echo "Failed to fetch rewards for $1"
         return
     fi
-    rewards=$(jq -r ".rewards[0].amount | tonumber | floor" "$tmp")
-    if [ "$rewards" -le "${THRESHOLD}" ]; then
+    rewards=$(jq -r ".rewards[0].amount | tonumber | floor" "${tmp}.rewards")
+    if [ "$(jq -n "${rewards} >= ${THRESHOLD}")" = "false" ]; then
         echo "$1 rewards ${rewards} too low, skipping."
         return
     fi
 
     # generate claim-and-restake tx
 
-    ${BIN} tx distribution withdraw-rewards "${VALIDATOR}" --from "$1" --gas "${GAS:-200000}" --generate-only > "${TMP}/$1.withdraw"
-    ${BIN} tx staking delegate "${VALIDATOR}" "${rewards}${DENOM}" --from "$1" --gas "${GAS:-200000}" --generate-only > "${TMP}/$1.delegate"
+    ${BIN} tx staking delegate "${VALIDATOR}" "${rewards}${DENOM}" --from "$1" --gas "${GAS_LIMIT:-200000}" --generate-only > "${TMP}/$1.delegate"
 
-    if ! jq -s '(map(.body.messages) | flatten) as $msgs | .[0].body.messages |= $msgs | .[0]' "${TMP}/$1.withdraw" "${TMP}/$1.delegate" |\
+    if ! jq -s '(map(.body.messages) | flatten) as $msgs | .[0].body.messages |= $msgs | .[0]' "${TMP}/$1.delegate" |\
         ${BIN} tx authz exec - --from "$BOT" --generate-only > "${TMP}/$1.exec"; then
         echo "Failed to generate exec transaction!"
         return
@@ -200,8 +216,11 @@ sign_and_send() {
         echo "Batch $(( ++batch )) = $count txs"
 
         # sign and submit transaction
-        ${BIN} tx sign "${tx}" --from "${BOT}" --chain-id "${CHAIN}" |\
+        2>&1 ${BIN} tx sign "${tx}" --from "${BOT}" --chain-id "${CHAIN}" |\
             ${BIN} tx broadcast - --broadcast-mode "${BROADCAST_MODE:-block}"
+
+        #echo "Sleeping 5 seconds ..."
+        #sleep 5
     done
 }
 
